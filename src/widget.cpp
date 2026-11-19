@@ -322,6 +322,43 @@ Mask RenderMask(const std::wstring& s, HFONT font, bool darkOnLight) {
     return m;
 }
 
+Mask RenderDeviceMask(DeviceKind kind, bool bluetooth, HFONT font, bool darkOnLight) {
+    static constexpr const char* visor[] = {
+        "................", "..############..", ".#............#.", "#..............#",
+        "#..............#", "#..............#", "#..............#", "#.....####.....#",
+        ".#####....#####.", "................", "................", "................"
+    };
+    static constexpr const char* controller[] = {
+        "......#####.....", ".....#.....#....", "....#..#....#...", "....#....#..#...",
+        ".....#.....#....", ".....######.....", ".....#....#.....", "....#....#......",
+        "....#...#.......", "...#....#.......", "...#...#........", "....###........."
+    };
+    static constexpr const char* tracker[] = {
+        ".......##.......", "......#..#......", ".....#....#.....", "....#......#....",
+        "...#...##...#...", "..#...#..#...#..", ".#....#..#....#.", "#......##......#",
+        "#..............#", ".###........###.", "....########....", "................"
+    };
+    const char* const* pixels = nullptr;
+    switch (kind) {
+        case DeviceKind::VrHeadset: pixels = visor; break;
+        case DeviceKind::VrController: pixels = controller; break;
+        case DeviceKind::VrTracker: pixels = tracker; break;
+        default: return RenderMask(std::wstring(1, Glyph(kind, bluetooth)), font, darkOnLight);
+    }
+    Mask mask;
+    mask.w = std::max(1, Px(16));
+    mask.h = std::max(1, Px(12));
+    mask.a.resize(static_cast<size_t>(mask.w) * mask.h);
+    for (int y = 0; y < mask.h; ++y) {
+        for (int x = 0; x < mask.w; ++x) {
+            const int row = (2 * y + 1) * 12 / (2 * mask.h);
+            const int column = (2 * x + 1) * 16 / (2 * mask.w);
+            mask.a[y * mask.w + x] = pixels[row][column] == '#' ? 255 : 0;
+        }
+    }
+    return mask;
+}
+
 struct Rgb { int r, g, b; };
 
 struct Canvas {
@@ -421,7 +458,7 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
         bool branded = it.accent != Accent::None;
         BrandColor bc = AccentColor(it.accent, g_light);
         Rgb accent{ bc.r, bc.g, bc.b };
-        Piece icon{ RenderMask(std::wstring(1, Glyph(it.kind, it.bluetooth)), icons, g_light), branded ? accent : fg, a, Px(5) };
+        Piece icon{ RenderDeviceMask(it.kind, it.bluetooth, icons, g_light), branded ? accent : fg, a, Px(5) };
         if (branded && !it.dim) {
             icon.haloR = Px(3);
             icon.halo = Halo(icon.m, icon.haloR);
@@ -429,6 +466,14 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
         }
         out.push_back(std::move(icon));
         std::wstring t = !it.text.empty() ? it.text : it.percent >= 0 ? std::to_wstring(it.percent) + L"%" : L"?";
+        if (!it.shortName.empty()) {
+            std::wstring name = it.shortName;
+            if (name.size() > 4) {
+                const size_t length = name[3] >= 0xD800 && name[3] <= 0xDBFF ? 3 : 4;
+                name = name.substr(0, length) + L"\u2026";
+            }
+            t = name + L" " + t;
+        }
         Piece label{ RenderMask(t, text, g_light), tc, a, mark ? Px(2) : 0 };
         if (branded && it.percent >= 0) {
             label.barPct = it.percent;

@@ -9,6 +9,7 @@
 #include "drivers/drivers.h"
 #include "report.h"
 #include "hid.h"
+#include "vr_sources.h"
 
 namespace {
 
@@ -140,6 +141,7 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollBluetooth(ctx);   // before the generic HID check: Windows' own level wins for the same device
     PollGenericHid(ctx);
     PollXInput(ctx);
+    for (auto& device : vrbattery::PollSteamVr()) ctx.out.push_back(std::move(device));
     return ctx.out;
 }
 

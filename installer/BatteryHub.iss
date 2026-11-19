@@ -38,6 +38,8 @@ Name: "autostart"; Description: "Start BatteryHub when I sign in to Windows"
 [Files]
 Source: "{#Root}\BatteryHub.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\third_party\headsetcontrol\headsetcontrol.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Root}\third_party\openvr\openvr_api.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Root}\vendor\openvr\LICENSE"; DestDir: "{app}"; DestName: "OpenVR-LICENSE.txt"; Flags: ignoreversion
 Source: "{#Root}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "{#Root}\installer\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 

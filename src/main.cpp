@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <dbt.h>
+#include <commdlg.h>
 #include <initguid.h>
 #include <hidclass.h>
 
@@ -11,6 +12,8 @@
 #include <cstdio>
 #include <cwchar>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -27,12 +30,15 @@
 #include "widget.h"
 #include "update_win.h"
 #include "update_apply.h"
+#include "vr_battery.h"
+#include "vr_sources.h"
 
 namespace {
 
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_RESULTS = WM_APP + 2;
 constexpr UINT WM_WIDGET_CLICK = WM_APP + 3;
+constexpr UINT WM_QUEST_ADB_RESULTS = WM_APP + 4;
 constexpr UINT_PTR TIMER_DEBOUNCE = 1;
 constexpr UINT_PTR TIMER_WIDGET = 2;
 constexpr UINT_PTR TIMER_ALERT_ICON = 3;
@@ -45,7 +51,7 @@ constexpr UINT ALERT_ICON_ID = 2;
 
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_REPORT,
-    ID_BRAND_COLORS, ID_STACKED, ID_SHOW_DISCONNECTED, ID_RECORD_HISTORY,
+    ID_BRAND_COLORS, ID_STACKED, ID_SHOW_DISCONNECTED, ID_RECORD_HISTORY, ID_QUEST_ADB, ID_QUEST_ADB_DISABLE,
     ID_POLL_FIRST = 500,  // "Check battery every": ID_POLL_FIRST + 0..7
     ID_UPDATE = 200, ID_AUTO_UPDATE,
     ID_LANG_AUTO = 400, ID_LANG_ADD, ID_LANG_FIRST,  // "Language": ID_LANG_FIRST + 0..63
@@ -66,8 +72,10 @@ const wchar_t* kSettingsKey = L"Software\\WirelessBattery";
 HINSTANCE g_inst;
 HWND g_hwnd;
 HANDLE g_refreshEvt, g_stopEvt, g_worker;
+HANDLE g_questRefreshEvt, g_questWorker;
 UINT g_taskbarCreatedMsg;
 bool g_lightTaskbar;
+bool g_demo = false;
 bool g_wantWidget = true;      // user's choice: taskbar widget (default) or tray icons
 bool g_useWidget = false;      // what is actually shown right now
 bool g_hideLastKnown = false;  // hide (last known) / asleep devices from taskbar and tray
@@ -78,6 +86,14 @@ bool g_widgetBackground = false;  // draw a plate behind the taskbar text (trans
 bool g_stacked = false;      // icon above the percentage (menu option)
 bool g_brandColors = false;  // off by default; known brands get their color (Razer green, Logitech blue, ...)
 std::atomic<DWORD> g_pollIntervalMs{ 60 * 1000 };  // set from the menu, read by the worker thread
+
+struct QuestAdbResults {
+    vrbattery::QuestAdbConfig config;
+    std::vector<DeviceStatus> devices;
+};
+bool g_steamVrHeadset = false;
+std::optional<DeviceStatus> g_questAdbHeadset;
+ULONGLONG g_questAdbHeadsetAt = 0;
 
 struct TrayEntry {
     UINT uid = 0;
@@ -101,6 +117,13 @@ aliases::AliasMap g_aliases;
 
 std::wstring DisplayName(const TrayEntry& e) {
     return aliases::DisplayName(g_aliases, e.st.key, e.st.name);
+}
+
+std::wstring TooltipName(const TrayEntry& e) {
+    const auto display = DisplayName(e);
+    if (e.st.kind == DeviceKind::VrTracker && display != e.st.name)
+        return display + L" (" + e.st.name + L")";
+    return display;
 }
 
 void LoadAliases() {
@@ -533,7 +556,7 @@ void ApplyEntry(TrayEntry& e) {
                              : RenderIcon(L"\u00D7", -1, Foreground(), Foreground(), true);
         e.iconSig = sig;
     }
-    std::wstring tip = DisplayName(e) + L"\n" + StatusText(e);
+    std::wstring tip = TooltipName(e) + L"\n" + StatusText(e);
 
     TrayCall(e.added ? NIM_MODIFY : NIM_ADD, e.uid, e.icon, tip);
     e.added = true;
@@ -546,6 +569,9 @@ int KindOrder(DeviceKind k) {  // default order: headset first, then mouse, ...
         case DeviceKind::Keyboard: return 2;
         case DeviceKind::Gamepad:  return 3;
         case DeviceKind::Phone:    return 4;
+        case DeviceKind::VrHeadset: return 6;
+        case DeviceKind::VrController: return 7;
+        case DeviceKind::VrTracker: return 8;
         default:                   return 5;
     }
 }
@@ -568,6 +594,7 @@ std::vector<TrayEntry*> OrderedEntries(bool shownOnly) {
         if (ra != rb) return ra < rb;
         int ka = KindOrder(a->st.kind), kb = KindOrder(b->st.kind);
         if (ka != kb) return ka < kb;
+        if (a->st.kind == DeviceKind::VrController) return a->st.key < b->st.key;
         return DisplayName(*a) != DisplayName(*b) ? DisplayName(*a) < DisplayName(*b) : a->st.key < b->st.key;  // same name: keep a fixed order
     });
     return list;
@@ -595,24 +622,59 @@ void UpdateWidget() {
         it.low = !offline && !it.charging && it.percent >= 0 && it.percent <= LOW_BATTERY;
         it.bluetooth = e->st.via == L"Bluetooth";
         it.label = labels[items.size()];
+        if (e->st.kind == DeviceKind::VrController) {
+            const auto& key = e->st.key;
+            const bool left = key.size() >= 5 && key.compare(key.size() - 5, 5, L":left") == 0;
+            it.label = left ? L"L" : L"R";
+        }
+        if (e->st.kind == DeviceKind::VrTracker) {
+            const auto alias = g_aliases.find(e->st.key);
+            if (alias != g_aliases.end()) it.shortName = alias->second;
+            else if (!it.label.empty()) it.shortName = e->st.detail;
+            it.label.clear();
+        }
         it.accent = AccentFor(e->st);
         items.push_back(it);
         if (!tip.empty()) tip += L"\n";
-        tip += DisplayName(*e) + L": " + StatusText(*e);
+        tip += TooltipName(*e) + L": " + StatusText(*e);
     }
     if (tip.empty()) tip = std::wstring(L"BatteryHub: ") + T(L"No devices with battery info found");
     widget::SetItems(items, tip);
 }
 
-void OnResults(std::vector<DeviceStatus>& results) {
-    std::map<std::wstring, bool> seen;
+void OnResults(std::vector<DeviceStatus>& results, bool fromAdb = false) {
+    std::set<std::wstring> seen;
+    const ULONGLONG now = GetTickCount64();
+    const auto headset = std::find_if(results.begin(), results.end(), [](const DeviceStatus& device) {
+        return device.key == vrbattery::QuestHeadsetKey;
+    });
+    bool usingCachedHeadset = false;
+    if (fromAdb) {
+        g_questAdbHeadset = headset == results.end() ? std::nullopt : std::optional<DeviceStatus>(*headset);
+        g_questAdbHeadsetAt = now;
+    } else {
+        g_steamVrHeadset = headset != results.end();
+        if (!g_steamVrHeadset && g_questAdbHeadset && now - g_questAdbHeadsetAt < 2ULL * g_pollIntervalMs) {
+            const auto current = g_entries.find(vrbattery::QuestHeadsetKey);
+            if (current != g_entries.end() && current->second.st.via == g_questAdbHeadset->via) {
+                seen.insert(vrbattery::QuestHeadsetKey);
+            } else {
+                results.push_back(*g_questAdbHeadset);
+                usingCachedHeadset = true;
+            }
+        }
+    }
+
     for (auto& s : results) {
+        if (fromAdb && g_steamVrHeadset && s.kind == DeviceKind::VrHeadset) continue;
         auto& e = g_entries[s.key];
         if (!e.uid) e.uid = StableId(s.key);
         e.st = s;
         if (s.percent >= 0) e.lastPct = s.percent;
-        e.lastSeen = GetTickCount64();
-        seen[s.key] = true;
+        const bool cached = usingCachedHeadset && s.kind == DeviceKind::VrHeadset;
+        e.lastSeen = cached ? g_questAdbHeadsetAt : now;
+        seen.insert(s.key);
+        if (cached) { ApplyEntry(e); continue; }
         // Evaluate even in widget mode: ApplyEntry only manages tray icons.
         // Alert latches are kept by stable device key even if the driver briefly stops reporting it.
         if (const auto it = g_alertLatches.find(s.key); it != g_alertLatches.end())
@@ -628,17 +690,21 @@ void OnResults(std::vector<DeviceStatus>& results) {
     }
     for (auto it = g_entries.begin(); it != g_entries.end();) {
         auto& e = it->second;
+        const bool managesHeadset = e.st.kind == DeviceKind::VrHeadset && (!fromAdb || !g_steamVrHeadset);
+        const bool managesDevice = e.st.kind != DeviceKind::VrHeadset &&
+                                   (fromAdb == (e.st.kind == DeviceKind::VrController && !g_demo));
+        if (seen.count(it->first) || (!managesHeadset && !managesDevice)) { ++it; continue; }
         // Some receivers drop sleeping devices from the link; keep showing the last value for a while
         // (at least two poll intervals).
-        bool inGrace = !seen.count(it->first) && e.st.graceSec > 0 && e.st.connected &&
-                       GetTickCount64() - e.lastSeen <
+        bool inGrace = e.st.graceSec > 0 && e.st.connected && now - e.lastSeen <
                            std::max<ULONGLONG>((ULONGLONG)e.st.graceSec * 1000, 2ULL * g_pollIntervalMs);
         if (inGrace) {
             e.st.percent = -1;
             e.st.asleep = true;
+            if (vrbattery::IsVrKind(e.st.kind)) { e.st.charging = false; e.st.full = false; }
             ApplyEntry(e);
         }
-        if (!seen.count(it->first) && !inGrace) {
+        if (!inGrace) {
             if (it->second.added) TrayDelete(it->second.uid);
             if (it->second.icon) DestroyIcon(it->second.icon);
             it = g_entries.erase(it);
@@ -665,6 +731,11 @@ void Reconcile() {
     } else if (g_useWidget) {
         widget::Reposition();
     }
+}
+
+void RequestRefresh() {
+    if (g_refreshEvt) SetEvent(g_refreshEvt);
+    if (g_questRefreshEvt) SetEvent(g_questRefreshEvt);
 }
 
 void SetMode(bool useWidget) {
@@ -741,7 +812,7 @@ void SetBrandColors(bool on) {
 void SetPollSeconds(DWORD seconds) {
     g_pollIntervalMs = seconds * 1000;
     SavePollSeconds(seconds);
-    SetEvent(g_refreshEvt);  // poll now, so the new interval starts right away
+    RequestRefresh();  // poll now, so the new interval starts right away
 }
 
 void ToggleHidden(const std::wstring& key) {
@@ -786,7 +857,7 @@ void SetAlertOverride(const std::wstring& key, int threshold) {
     g_alertLatches.erase(key);
     auto it = g_entries.find(key);
     if (it != g_entries.end()) it->second.lowWarned = false;
-    SetEvent(g_refreshEvt);  // reconsider with a fresh reading; never alert from stale data
+    RequestRefresh();  // reconsider with a fresh reading; never alert from stale data
 }
 
 // Swaps a shown device with its neighbour (dir -1 = left, +1 = right) and remembers the new order.
@@ -804,6 +875,32 @@ void MoveEntry(const std::wstring& key, int dir) {
     g_order = order;
     SaveOrder();
     UpdateWidget();
+}
+
+void ChangeQuestAdb(bool disable) {
+    vrbattery::QuestAdbConfig config;
+    if (!disable) {
+        const auto current = vrbattery::LoadQuestAdbConfig();
+        std::wstring path(32768, L'\0');
+        OPENFILENAMEW dialog{ sizeof(dialog) };
+        dialog.hwndOwner = g_hwnd;
+        dialog.lpstrFilter = L"Android Debug Bridge (adb.exe)\0adb.exe\0\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.lpstrTitle = T(L"Select adb.exe from Android Platform-Tools");
+        dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&dialog)) return;
+        path.resize(wcslen(path.c_str()));
+        config.executable = std::move(path);
+        if (!PromptQuestAdbAddress(g_hwnd, current.endpoint, config.endpoint)) return;
+    }
+    if (!vrbattery::SaveQuestAdbConfig(config)) {
+        MessageBoxW(g_hwnd, T(L"Could not save the Quest ADB settings."), T(L"Quest Wi-Fi ADB"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    std::vector<DeviceStatus> empty;
+    OnResults(empty, true);  // Drop readings from the former ADB connection.
+    if (g_questRefreshEvt) SetEvent(g_questRefreshEvt);
 }
 
 void ShowMenu() {
@@ -915,6 +1012,13 @@ void ShowMenu() {
     }
     AppendMenuW(m, MF_STRING, ID_REFRESH, T(L"Refresh now"));
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, T(L"Start with Windows"));
+    if (!g_demo) {
+        HMENU sub = CreatePopupMenu();
+        AppendMenuW(sub, MF_STRING, ID_QUEST_ADB, T(L"Configure Quest Wi-Fi ADB..."));
+        if (vrbattery::LoadQuestAdbConfig().Enabled())
+            AppendMenuW(sub, MF_STRING, ID_QUEST_ADB_DISABLE, T(L"Disable Quest ADB polling"));
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, T(L"Quest Wi-Fi ADB"));
+    }
     AppendMenuW(m, MF_STRING, ID_REPORT, T(L"Request support for a device..."));
     AppendMenuW(m, MF_STRING, ID_SUPPORT, T(L"Support the project..."));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -932,8 +1036,10 @@ void ShowMenu() {
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     switch (cmd) {
-        case ID_REFRESH: SetEvent(g_refreshEvt); break;
+        case ID_REFRESH: RequestRefresh(); break;
         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
+        case ID_QUEST_ADB: ChangeQuestAdb(false); break;
+        case ID_QUEST_ADB_DISABLE: ChangeQuestAdb(true); break;
         case ID_HIDE_LAST_KNOWN: SetHideLastKnown(!g_hideLastKnown); break;
         case ID_SHOW_DISCONNECTED: SetShowDisconnectedDevices(!g_showDisconnectedDevices); break;
         case ID_RECORD_HISTORY: g_recordHistory = !g_recordHistory; SaveRecordHistory(g_recordHistory); break;
@@ -990,8 +1096,6 @@ void ShowMenu() {
 // `--demo`: one sample device of every brand instead of real ones, for screenshots and for checking the
 // brand colors without owning the hardware. Keys, vendor ids and names are mixed on purpose, so every way
 // of recognising a brand gets used.
-bool g_demo = false;
-
 std::vector<DeviceStatus> DemoDevices() {
     auto make = [](const wchar_t* key, const wchar_t* name, DeviceKind kind, int pct, unsigned short vid, bool charging) {
         DeviceStatus s;
@@ -1021,6 +1125,11 @@ std::vector<DeviceStatus> DemoDevices() {
         make(L"coolermaster:demo", L"Cooler Master MM712", DeviceKind::Mouse, 12, 0x2516, false),
         make(L"steam:demo", L"Steam Controller", DeviceKind::Gamepad, 50, 0x28DE, true),
         make(L"bt:demo-plain", L"Bluetooth Headphones", DeviceKind::Headset, 100, 0, true),  // charging at 100%: fully charged
+        make(L"vr:demo:headset", L"Meta Quest 3", DeviceKind::VrHeadset, 72, 0, true),
+        make(L"vr:quest3:demo:left", L"Touch Plus Left", DeviceKind::VrController, 84, 0, false),
+        make(L"vr:quest3:demo:right", L"Touch Plus Right", DeviceKind::VrController, 61, 0, false),
+        make(L"vr:demo:tracker1", L"VIVE Tracker 2.0", DeviceKind::VrTracker, 48, 0, false),
+        make(L"vr:demo:tracker2", L"VIVE Tracker 3.0", DeviceKind::VrTracker, 91, 0, false),
     };
     DeviceStatus offline = make(L"demo:offline-receiver", L"Offline wireless headset", DeviceKind::Headset, -1, 0, false);
     offline.via = L"2.4 GHz receiver";
@@ -1043,6 +1152,21 @@ DWORD WINAPI Worker(LPVOID) {
     }
 }
 
+DWORD WINAPI QuestAdbWorker(LPVOID) {
+    vrbattery::QuestAdbPoller poller;
+    HANDLE events[] = { g_stopEvt, g_questRefreshEvt };
+    for (;;) {
+        auto config = vrbattery::LoadQuestAdbConfig();
+        if (config.Enabled()) {
+            auto devices = poller.Poll(config, g_stopEvt);
+            if (WaitForSingleObject(g_stopEvt, 0) == WAIT_OBJECT_0) return 0;
+            auto* result = new QuestAdbResults{std::move(config), std::move(devices)};
+            if (!PostMessageW(g_hwnd, WM_QUEST_ADB_RESULTS, 0, reinterpret_cast<LPARAM>(result))) delete result;
+        }
+        if (WaitForMultipleObjects(ARRAYSIZE(events), events, FALSE, g_pollIntervalMs) == WAIT_OBJECT_0) return 0;
+    }
+}
+
 void RefreshSoon(UINT ms) { SetTimer(g_hwnd, TIMER_DEBOUNCE, ms, nullptr); }
 
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1060,6 +1184,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             auto* v = reinterpret_cast<std::vector<DeviceStatus>*>(lp);
             OnResults(*v);
             delete v;
+            return 0;
+        }
+        case WM_QUEST_ADB_RESULTS: {
+            std::unique_ptr<QuestAdbResults> result(reinterpret_cast<QuestAdbResults*>(lp));
+            if (result->config == vrbattery::LoadQuestAdbConfig()) OnResults(result->devices, true);
             return 0;
         }
         case WM_TRAY:
@@ -1082,7 +1211,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == PBT_APMRESUMEAUTOMATIC) RefreshSoon(5000);
             return TRUE;
         case WM_TIMER:
-            if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); SetEvent(g_refreshEvt); }
+            if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); RequestRefresh(); }
             if (wp == TIMER_WIDGET) { Reconcile(); updates::Tick(h); }
             if (wp == TIMER_ALERT_ICON) {
                 KillTimer(h, TIMER_ALERT_ICON);
@@ -1102,6 +1231,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_alertIconAdded) { TrayDelete(ALERT_ICON_ID); g_alertIconAdded = false; }
             widget::Destroy();
             SetEvent(g_stopEvt);
+            if (g_questWorker) WaitForSingleObject(g_questWorker, 5000);
             if (g_worker) WaitForSingleObject(g_worker, 5000);
             for (auto& [k, e] : g_entries) {
                 if (e.added) TrayDelete(e.uid);
@@ -1112,6 +1242,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
+}
+
+std::vector<DeviceStatus> PollForConsole() {
+    auto list = PollAllDevices();
+    vrbattery::QuestAdbPoller poller;
+    vrbattery::AppendQuestAdb(list, poller.Poll(vrbattery::LoadQuestAdbConfig()));
+    return list;
 }
 
 // `BatteryHub.exe --list` prints what it finds, `--dump` every HID collection.
@@ -1153,7 +1290,7 @@ int ListToConsole(bool dump) {
         }
         return 0;
     }
-    auto list = PollAllDevices();
+    auto list = PollForConsole();
     if (list.empty()) write(L"No devices with battery info found.\n");
     for (auto& s : list) {
         Accent accent = BrandOf(s);
@@ -1180,7 +1317,7 @@ int ListJson() {
         if (AttachConsole(ATTACH_PARENT_PROCESS))
             out = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     }
-    std::string text = DevicesToJson(PollAllDevices());  // UTF-8
+    std::string text = DevicesToJson(PollForConsole());  // UTF-8
     if (out && out != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
         WriteFile(out, text.data(), (DWORD)text.size(), &written, nullptr);
@@ -1262,6 +1399,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
 
     g_refreshEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_stopEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_questRefreshEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_wantWidget = LoadWidgetMode();
     g_hideLastKnown = LoadHideLastKnown();
     g_showDisconnectedDevices = LoadShowDisconnectedDevices();
@@ -1284,6 +1422,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     UpdatePlaceholder();  // something to click on until the first poll finishes
     SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);
     g_worker = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+    if (!g_demo && g_stopEvt && g_questRefreshEvt)
+        g_questWorker = CreateThread(nullptr, 0, QuestAdbWorker, nullptr, 0, nullptr);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
@@ -1293,7 +1433,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     }
     // drain results posted after shutdown started
     while (PeekMessageW(&m, nullptr, WM_RESULTS, WM_RESULTS, PM_REMOVE)) delete reinterpret_cast<std::vector<DeviceStatus>*>(m.lParam);
+    while (PeekMessageW(&m, nullptr, WM_QUEST_ADB_RESULTS, WM_QUEST_ADB_RESULTS, PM_REMOVE))
+        delete reinterpret_cast<QuestAdbResults*>(m.lParam);
     if (notify) UnregisterDeviceNotification(notify);
+    if (g_questWorker) CloseHandle(g_questWorker);
+    if (g_questRefreshEvt) CloseHandle(g_questRefreshEvt);
     if (g_worker) CloseHandle(g_worker);
     ReleaseMutex(mutex);
     return 0;

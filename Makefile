@@ -7,7 +7,7 @@ CHANNEL  ?= dev
 CXXFLAGS ?= -std=c++17 -Os -Wall -Wno-missing-field-initializers -ffunction-sections -fdata-sections \
             -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00
 LDFLAGS  ?= -municode -mwindows -static -s -Wl,--gc-sections
-LIBS     := -lhid -lsetupapi -lcfgmgr32 -lole32 -loleaut32 -lcomctl32 -lgdi32 -lruntimeobject -lws2_32 -lwinhttp -lbcrypt -lversion -lbluetoothapis
+LIBS     := -lhid -lsetupapi -lcfgmgr32 -lole32 -loleaut32 -lcomctl32 -lcomdlg32 -lgdi32 -lruntimeobject -lws2_32 -lwinhttp -lbcrypt -lversion -lbluetoothapis
 
 SRC := $(wildcard src/*.cpp) $(wildcard src/drivers/*.cpp)
 OBJ := $(patsubst src/%.cpp,build/%.o,$(SRC)) build/app_res.o
@@ -18,6 +18,8 @@ BatteryHub.exe: $(OBJ)
 build/%.o: src/%.cpp $(wildcard src/*.h src/drivers/*.h) build/version.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -municode -c $< -o $@
+
+build/vr_steam.o: vendor/openvr/openvr_capi.h
 
 build/version.h: scripts/generate-version.ps1 FORCE
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/generate-version.ps1 -Version "$(VERSION)" -Channel "$(CHANNEL)"
@@ -36,6 +38,8 @@ clean:
 
 test: test-update-core test-update-win test-update-signature
 	@mkdir -p build
+	$(CXX) $(CXXFLAGS) tests/vr_battery_test.cpp src/vr_battery.cpp src/vr_adb.cpp -o build/vr_battery_test.exe -lws2_32
+	./build/vr_battery_test.exe
 	$(CXX) -std=c++17 -O2 -Wall tests/device_aliases_test.cpp -o build/device_aliases_test.exe
 	./build/device_aliases_test.exe
 	$(CXX) -std=c++17 -O2 -Wall -Wextra tests/alert_rules_test.cpp -o build/alert_rules_test.exe

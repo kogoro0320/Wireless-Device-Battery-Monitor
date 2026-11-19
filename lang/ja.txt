@@ -100,3 +100,12 @@ USB base station = USB ベースステーション
 USB cable = USB ケーブル
 UWB base station = UWB ベースステーション
 Wireless adapter = ワイヤレスアダプター
+
+Quest Wi-Fi ADB = Quest Wi-Fi ADB
+Quest ADB = Quest ADB
+Select adb.exe from Android Platform-Tools = Android Platform-Tools の adb.exe を選択
+Quest IP address and port (optional) = Quest の IP アドレス（ポートは省略可）
+Enter the Quest's IP address, optionally with a port. = Quest の IP アドレスを入力してください。ポートは省略できます。
+Configure Quest Wi-Fi ADB... = Quest の Wi-Fi ADB を設定...
+Could not save the Quest ADB settings. = Quest の ADB 設定を保存できませんでした。
+Disable Quest ADB polling = Quest の ADB 取得をオフにする

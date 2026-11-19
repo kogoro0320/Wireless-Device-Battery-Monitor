@@ -248,6 +248,14 @@ anywhere and run `BatteryHub.exe`.
 - **Tray-icon mode on Windows 11:** new tray icons go to the `^` overflow. Drag them onto the taskbar or enable them in *Settings → Personalization → Taskbar → Other system tray icons*.
 - **Keeping the app away from a device:** if a device misbehaves while the app is running, list it in the registry string `IgnoreDevices` under `HKCU\Software\WirelessBattery` as `VID:PID` pairs (hex, separated by commas, e.g. `28BD:0947, 1234:ABCD`; `--dump` shows the ids). The app then never opens it. Drawing tablets are skipped automatically.
 
+## Quest 3 and VIVE Tracker on Windows
+
+- **Quest 3 headset:** launch SteamVR from Virtual Desktop. BatteryHub reads the headset from the running SteamVR session. It uses the configured Wi-Fi ADB connection when the SteamVR reading is unavailable.
+- **Touch Plus:** use [Meta's Wi-Fi ADB setup](https://developers.meta.com/vr/documentation/native/android/ts-adb/#connect-adb-via-wi-fi). In BatteryHub, open **Quest Wi-Fi ADB → Configure Quest Wi-Fi ADB...**, select `adb.exe` from [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools), then enter the headset IP address and optional port. The left and right entries update separately. **Disable Quest ADB polling** clears BatteryHub's local configuration.
+- **VIVE Tracker 2.0 (2018) and 3.0:** start SteamVR and connect your physical Lighthouse trackers as usual. In the BatteryHub device menu, use **Rename device...** to give each tracker a name such as `Waist` or `Left foot`. BatteryHub stores the names locally by tracker serial number, so they follow the same unit after it reconnects.
+
+Keep `openvr_api.dll` alongside `BatteryHub.exe` for SteamVR support. The portable ZIP contains the Valve DLL. Quest ADB configuration and tracker names are local to the current Windows account. The diagnostic CLI output may contain device identifiers.
+
 ## Updates on Windows
 
 Official stable Windows builds check the project's latest published stable release in the
@@ -333,6 +341,8 @@ differs from the executable. It downloads the pinned
 HeadsetControl release and verifies its checksum. GitHub Actions does all of this automatically:
 pushing a tag like `v1.0.0` publishes a release with the installer, the portable zip and the
 HeadsetControl source (as its GPL license requires).
+
+Add `-PortableOnly` to create just the portable ZIP and its checksum without Inno Setup.
 
 Windows builds also need PowerShell for generating the shared executable/resource version.
 The official repository's version tags build with `CHANNEL=stable`; local builds default to

@@ -1,6 +1,7 @@
 #include "rename_dialog.h"
 #include "device_aliases.h"
 #include "i18n.h"
+#include "vr_sources.h"
 
 #include <algorithm>
 #include <vector>
@@ -13,6 +14,7 @@ struct EditorState {
     std::wstring result;
     HWND edit = nullptr;
     bool accepted = false;
+    bool address = false;
 };
 
 EditorState* State(HWND hwnd) {
@@ -37,7 +39,7 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HINSTANCE inst = GetModuleHandleW(nullptr);
             const int dpi = GetDpiForWindow(hwnd);
             auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
-            HWND label = CreateWindowExW(0, L"STATIC", T(L"Device display name:"),
+            HWND label = CreateWindowExW(0, L"STATIC", T(state->address ? L"Quest IP address and port (optional)" : L"Device display name:"),
                                          WS_CHILD | WS_VISIBLE, scale(16), scale(18), scale(382), scale(22),
                                          hwnd, nullptr, inst, nullptr);
             state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", state->initial.c_str(),
@@ -56,7 +58,7 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetControlFont(state->edit);
             SetControlFont(save);
             SetControlFont(cancel);
-            SendMessageW(state->edit, EM_SETLIMITTEXT, aliases::kMaxNameLength, 0);
+            SendMessageW(state->edit, EM_SETLIMITTEXT, state->address ? 80 : aliases::kMaxNameLength, 0);
             SetFocus(state->edit);
             SendMessageW(state->edit, EM_SETSEL, 0, -1);
             return 0;
@@ -67,8 +69,10 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1, 0);
                 GetWindowTextW(state->edit, buffer.data(), (int)buffer.size());
                 std::wstring name = aliases::Trim(buffer.data());
-                if (!aliases::ValidName(name)) {
-                    MessageBoxW(hwnd, T(L"Enter a name (1-64 characters)."), T(L"Rename device"), MB_OK | MB_ICONINFORMATION);
+                if (state->address) name = vrbattery::NormalizeAdbEndpoint(name);
+                if (state->address ? name.empty() : !aliases::ValidName(name)) {
+                    MessageBoxW(hwnd, T(state->address ? L"Enter the Quest's IP address, optionally with a port." : L"Enter a name (1-64 characters)."),
+                                T(state->address ? L"Quest Wi-Fi ADB" : L"Rename device"), MB_OK | MB_ICONINFORMATION);
                     SetFocus(state->edit);
                     return 0;
                 }
@@ -83,9 +87,7 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
-}  // namespace
-
-bool PromptDeviceName(HWND owner, const std::wstring& currentName, std::wstring& result) {
+bool PromptEditor(HWND owner, const std::wstring& initial, std::wstring& result, bool address) {
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.hInstance = inst;
@@ -110,9 +112,10 @@ bool PromptDeviceName(HWND owner, const std::wstring& currentName, std::wstring&
     y = std::max(y, static_cast<int>(area.top));
 
     EditorState state;
-    state.initial = currentName;
+    state.initial = initial;
+    state.address = address;
     HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW, kWindowClass,
-                                   T(L"Rename device"), WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                                   T(address ? L"Quest Wi-Fi ADB" : L"Rename device"), WS_CAPTION | WS_SYSMENU | WS_POPUP,
                                    x, y, width, height, owner, nullptr, inst, &state);
     if (!dialog) return false;
 
@@ -141,4 +144,13 @@ bool PromptDeviceName(HWND owner, const std::wstring& currentName, std::wstring&
     if (ownerEnabled) EnableWindow(owner, TRUE);
     if (state.accepted) result = std::move(state.result);
     return state.accepted;
+}
+}  // namespace
+
+bool PromptDeviceName(HWND owner, const std::wstring& currentName, std::wstring& result) {
+    return PromptEditor(owner, currentName, result, false);
+}
+
+bool PromptQuestAdbAddress(HWND owner, const std::wstring& currentAddress, std::wstring& result) {
+    return PromptEditor(owner, currentAddress, result, true);
 }
